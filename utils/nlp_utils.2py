@@ -1,0 +1,544 @@
+import spacy
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from sentence_transformers import SentenceTransformer,util
+from transformers import pipeline, BartForConditionalGeneration, BartTokenizer,DistilBertTokenizer, DistilBertForQuestionAnswering
+import re
+import logging
+import json
+import nltk
+from pymongo import MongoClient
+from bson.json_util import dumps
+from nltk.corpus import wordnet
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import BertForQuestionAnswering, BertTokenizer
+import torch
+
+# MongoDB setup
+mongo_client = MongoClient('mongodb://localhost:27017/')
+mongo_db = mongo_client['your_database_name']
+inventory_collection = mongo_db['inventory']
+
+
+sentence_transformer_model = SentenceTransformer('all-MiniLM-L12-v2')
+qa_model = pipeline('question-answering', model='deepset/roberta-base-squad2')
+
+# Load the BART model and tokenizer
+bart_model = BartForConditionalGeneration.from_pretrained('facebook/bart-large-cnn')
+bart_tokenizer = BartTokenizer.from_pretrained('facebook/bart-large-cnn')
+bert_model = BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+bert_tokenizer = BertTokenizer.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
+
+
+nlp = spacy.load('en_core_web_sm')
+lemmatizer = WordNetLemmatizer()
+stop_words = set(stopwords.words('english'))
+sentence_transformer_model = SentenceTransformer('all-MiniLM-L12-v2')
+qa_model = pipeline('question-answering', model='deepset/roberta-base-squad2')
+bart_model = BartForConditionalGeneration.from_pretrained('facebook/bart-large-cnn')
+bart_tokenizer = BartTokenizer.from_pretrained('facebook/bart-large-cnn')
+
+embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-cased-distilled-squad')
+
+
+# Constants
+TOP_K = 5
+MAX_LENGTH = 200
+NUM_BEAMS = 4
+LENGTH_PENALTY = 2.0
+
+def preprocess_text(text):
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    words = [word for word in text.split() if word not in stop_words]
+    words = [lemmatizer.lemmatize(word) for word in words]
+    return ' '.join(words)
+
+
+
+def get_formatted_inventory():
+    try:
+        inventory = list(inventory_collection.find({}, {'_id': 0}))
+        return inventory  # Return the list directly, not as a JSON string
+    except Exception as e:
+        logging.error(f"Error fetching inventory data: {e}")
+        return None
+
+
+
+
+
+def product_to_text(product):
+    """Convert a product dictionary to a text representation."""
+    text_parts = []
+    for key, value in product.items():
+        if key != 'id':  # Exclude the id from the text representation
+            text_parts.append(f"{key}: {value}")
+    return " | ".join(text_parts)
+
+
+
+
+def create_product_embeddings(products):
+    """Create embeddings for a list of products."""
+    product_texts = [product_to_text(p) for p in products]
+    return embed_model.encode(product_texts), product_texts
+
+products = get_formatted_inventory()
+if products is not None:
+    product_embeddings, product_texts = create_product_embeddings(products)
+else:
+    logging.error("Failed to fetch inventory data")
+    product_embeddings, product_texts = [], []
+
+
+
+
+def get_relevant_product(query, top_k=1):
+    expanded_query = expand_query_with_wordnet(query)
+    query_embedding = embed_model.encode([expanded_query])
+    similarities = cosine_similarity(query_embedding, product_embeddings)[0]
+    top_indices = similarities.argsort()[-top_k:][::-1]
+    return [product_texts[i] for i in top_indices]
+
+
+
+
+def expand_query_with_wordnet(query):
+    """Expand the query using WordNet to include synonyms and related terms."""
+    words = query.split()
+    expanded_words = set(words)
+    
+    for word in words:
+        synsets = wordnet.synsets(word)
+        for syn in synsets:
+            for lemma in syn.lemmas():
+                expanded_words.add(lemma.name())
+    
+    expanded_query = " ".join(expanded_words)
+    return expanded_query
+
+
+
+
+
+
+# New function to fetch and format inventory data
+def get_formatted_inventory():
+    try:
+        inventory = list(inventory_collection.find({}, {'_id': 0}))
+        print(inventory)
+        return dumps(inventory)
+    
+    except Exception as e:
+        logging.error(f"Error fetching inventory data: {e}")
+        return None
+
+
+
+
+# 5. Function to answer questions
+def answer_question(question, context):
+    # Encode the question and context for the DistilBERT model
+    inputs = tokenizer.encode_plus(question, context, return_tensors="pt", max_length=512, truncation=True)
+    
+    # Get the answer from DistilBERT
+    outputs = qa_model(**inputs)
+    answer_start = torch.argmax(outputs.start_logits)
+    answer_end = torch.argmax(outputs.end_logits) + 1
+    answer = tokenizer.decode(inputs["input_ids"][0][answer_start:answer_end])
+
+    # Use BART to generate a more natural response
+    input_text = f"Generate a natural response to the question '{question}' based on this information: {context}. The key answer is: {answer}"
+    input_ids = bart_tokenizer.encode(input_text, return_tensors='pt', max_length=1024, truncation=True)
+    summary_ids = bart_model.generate(input_ids, max_length=150, num_beams=4, length_penalty=2.0, early_stopping=True)
+    complete_answer = bart_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+
+    return complete_answer
+
+
+def get_general_answer(data, question):
+    try:
+        chatbot_data = json.loads(data)
+        pdf_data = chatbot_data.get('pdf_data', [])
+    except json.JSONDecodeError:
+        logging.error("Failed to decode chatbot data")
+        return "I'm sorry, but there seems to be an issue with our data. Please try again later."
+
+    chunks = []
+    for item in pdf_data:
+        if 'text' in item:
+            text_chunks = nltk.sent_tokenize(item['text'])
+            chunks.extend(text_chunks)
+
+    if not chunks:
+        return "I'm sorry, but I don't have enough information to answer your question."
+
+    preprocessed_chunks = [preprocess_text(chunk) for chunk in chunks]
+    question_embedding = sentence_transformer_model.encode(preprocess_text(question), convert_to_tensor=True)
+    chunk_embeddings = sentence_transformer_model.encode(preprocessed_chunks, convert_to_tensor=True)
+
+    similarity_scores = util.pytorch_cos_sim(question_embedding, chunk_embeddings)[0]
+    top_k = min(TOP_K, len(similarity_scores))
+    best_match_indices = similarity_scores.topk(top_k).indices.tolist()
+    context = " ".join([chunks[i] for i in best_match_indices])
+
+    qa_input = {'question': question, 'context': context}
+    result = qa_model(qa_input)
+
+    input_text = f"question: {question} context: {context}"
+    input_ids = bart_tokenizer.encode(input_text, return_tensors='pt')
+    summary_ids = bart_model.generate(input_ids, max_length=150, num_beams=4, length_penalty=2.0, early_stopping=True)
+    complete_answer = bart_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+
+    return complete_answer
+
+#-----------------------------------------------------------------------------------
+# FIRST ITERATION  OF get_inventory_rag_answer FUNCTION
+#----------------------------------------------------------------------------------
+# def get_inventory_rag_answer(data, question):
+#     try:
+#         chatbot_data = json.loads(data)
+#         db_data = chatbot_data.get('db_data', [])
+#         if db_data:
+#             inventory_data = json.loads(db_data[0]['text'])
+#         else:
+#             return "I'm sorry, but I couldn't find any inventory information."
+#     except json.JSONDecodeError:
+#         logging.error("Failed to decode inventory data")
+#         return "I'm sorry, but there seems to be an issue with our inventory data. Please try again later."
+
+#     inventory_items = []
+#     for item in inventory_data:
+#         if all(key in item for key in ['name', 'category', 'price', 'quantity']):
+#             inventory_items.append(
+#                 f"{item['name']} is in the {item['category']} category, costs ${item['price']}, and we have {item['quantity']} in stock."
+#             )
+
+#     if not inventory_items:
+#         return "I'm sorry, but I couldn't find any relevant inventory information to answer your question."
+
+#     inventory_embeddings = sentence_transformer_model.encode(inventory_items, convert_to_tensor=True)
+#     question_embedding = sentence_transformer_model.encode(question, convert_to_tensor=True)
+
+#     similarity_scores = util.pytorch_cos_sim(question_embedding, inventory_embeddings)[0]
+#     top_k = min(TOP_K, len(similarity_scores))
+#     best_match_indices = similarity_scores.topk(top_k).indices.tolist()
+#     relevant_context = " ".join(inventory_items[i] for i in best_match_indices)
+
+#     augmented_context = (
+#         f"Answer the following question about our inventory: {question}\n\n"
+#         f"Inventory information:\n{relevant_context}\n\n"
+#         "Provide a concise, accurate, and relevant answer based only on the given inventory information. "
+#         "If the question cannot be answered with the provided information, say so."
+#     )
+
+#     input_ids = bart_tokenizer.encode(augmented_context, return_tensors='pt')
+#     summary_ids = bart_model.generate(
+#         input_ids,
+#         max_length=MAX_LENGTH,
+#         num_beams=NUM_BEAMS,
+#         length_penalty=LENGTH_PENALTY,
+#         early_stopping=True
+#     )
+#     answer = bart_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+
+#     return answer
+
+
+#---------------------------------------------------------------------
+# SECOND ITERATION OF RAG INVENTORY FUNCTION
+#---------------------------------------------------------------------
+
+# def get_inventory_rag_answer(data, question):
+#     try:
+#         chatbot_data = json.loads(data)
+#         db_data = chatbot_data.get('db_data', [])
+#         if db_data:
+#             inventory_data = json.loads(db_data[0]['text'])
+#         else:
+#             return "I'm sorry, but I couldn't find any inventory information."
+#     except json.JSONDecodeError:
+#         logging.error("Failed to decode inventory data")
+#         return "I'm sorry, but there seems to be an issue with our inventory data. Please try again later."
+
+#     # Preprocess the question
+#     question_tokens = preprocess_text(question).split()
+
+#     # Initialize a dictionary to store the relevant inventory items
+#     relevant_inventory = {}
+
+#     # Iterate through the inventory items and check for relevance
+#     for item in inventory_data:
+#         if all(key in item for key in ['name', 'category', 'price', 'quantity']):
+#             item_text = product_to_text(item)
+#             item_tokens = preprocess_text(item_text).split()
+
+#             # Check if the question contains any of the item's tokens
+#             for token in question_tokens:
+#                 if token in item_tokens:
+#                     relevant_inventory[item['name']] = item
+
+#     # Generate the answer based on the relevant inventory items
+#     if relevant_inventory:
+#         answer_parts = []
+#         for item_name, item in relevant_inventory.items():
+#             answer_parts.append(
+#                 f"{item_name} is in the {item['category']} category, costs ${item['price']}, and we have {item['quantity']} in stock."
+#             )
+#         answer = "\n\n".join(answer_parts)
+#     else:
+#         answer = "I'm sorry, but I couldn't find any relevant inventory information to answer your question."
+
+#     return answer
+
+
+#------------------------------------------------------
+# THIRD ITERATION OF RAG INVENTORY FUNCTION
+#------------------------------------------------------
+# def get_inventory_rag_answer(data, question):
+#     try:
+#         chatbot_data = json.loads(data)
+#         db_data = chatbot_data.get('db_data', [])
+#         if db_data:
+#             inventory_data = json.loads(db_data[0]['text'])
+#         else:
+#             return "I'm sorry, but I couldn't find any inventory information."
+#     except json.JSONDecodeError:
+#         logging.error("Failed to decode inventory data")
+#         return "I'm sorry, but there seems to be an issue with our inventory data. Please try again later."
+
+#     # Preprocess the question
+#     question_tokens = preprocess_text(question).split()
+
+#     # Initialize a dictionary to store the relevant inventory items
+#     relevant_inventory = {}
+
+#     # Iterate through the inventory items and check for relevance
+#     for item in inventory_data:
+#         item_text = product_to_text(item)
+#         item_tokens = preprocess_text(item_text).split()
+
+#         # Check if the question contains any of the item's tokens
+#         for token in question_tokens:
+#             if token in item_tokens:
+#                 relevant_inventory[item_text] = item
+#                 break
+
+#      # Initialize the answer variable
+#     answer = ""
+
+#     # Generate the answer based on the relevant inventory items
+#     if relevant_inventory:
+#         answer_parts = []
+#         for item_text, item in relevant_inventory.items():
+#             answer_part = []
+#             for key, value in item.items():
+#                 if key != 'id':
+#                     answer_part.append(f"{key}: {value}")
+#             answer_parts.append("\n".join(answer_part))
+        
+#         answer = "\n\n".join(answer_parts)
+#     else:
+#         answer = "I'm sorry, but I couldn't find any relevant inventory information to answer your question."
+
+#     return answer
+    
+
+
+# from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+# import torch
+
+# def get_inventory_rag_answer(data, question):
+#     try:
+#         chatbot_data = json.loads(data)
+#         db_data = chatbot_data.get('db_data', [])
+#         if db_data:
+#             inventory_data = json.loads(db_data[0]['text'])
+#         else:
+#             return "I'm sorry, but I couldn't find any inventory information."
+#     except json.JSONDecodeError:
+#         logging.error("Failed to decode inventory data")
+#         return "I'm sorry, but there seems to be an issue with our inventory data. Please try again later."
+
+#     # Preprocess the question
+#     question_tokens = preprocess_text(question).split()
+
+#     # Initialize a dictionary to store the relevant inventory items
+#     relevant_inventory = {}
+
+#     # Iterate through the inventory items and check for relevance
+#     for item in inventory_data:
+#         item_text = product_to_text(item)
+#         item_tokens = preprocess_text(item_text).split()
+
+#         # Check if the question contains any of the item's tokens
+#         for token in question_tokens:
+#             if token in item_tokens:
+#                 relevant_inventory[item_text] = item
+#                 break
+
+#     # Initialize the answer variable
+#     answer = "I'm sorry, but I couldn't find any relevant inventory information to answer your question."
+#     if relevant_inventory:
+#         answer_parts = []
+#         for item_text, item in relevant_inventory.items():
+#             answer_part = []
+#             for key, value in item.items():
+#                 if key != 'id':
+#                     answer_part.append(f"{key}: {value}")
+#             answer_parts.append("\n".join(answer_part))
+
+#         complete_answer = "\n\n".join(answer_parts)
+
+#         model_name = "google/flan-t5-base"
+#         model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+#         tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+#         input_text = f"""Task: Provide a comprehensive answer to the question using the given information. 
+#         Your response should be in complete sentences and include all relevant details.
+
+# Question: {question}
+
+# Information:
+# {complete_answer}
+
+# Instructions:
+# 1. Start with a direct answer to the question.
+# 2. Provide additional context or details from the information given.
+# 3. If there are multiple relevant items, mention them all.
+# 4. Ensure your answer is at least two sentences long.
+# 5. Use proper grammar and punctuation.
+# """
+
+#         input_ids = tokenizer(input_text, return_tensors="pt").input_ids
+
+#         outputs = model.generate(
+#             input_ids,
+#             max_length=300,
+#             num_return_sequences=1,
+#             do_sample=True,
+#             top_k=50,
+#             top_p=0.95,
+#             temperature=0.7,
+#             num_beams=4,
+#             early_stopping=True
+#         )
+
+#         answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+#         # Post-process the answer
+#         answer = re.sub(r'\s+', ' ', answer).strip()  # Remove extra whitespace
+#         answer = answer.capitalize()  # Capitalize the first letter
+#         if not answer.endswith(('.', '!', '?')):  # Ensure the answer ends with proper punctuation
+#             answer += '.'
+
+#         # If the answer is still too short or doesn't address the question properly
+#         if len(answer.split()) < 20 or "price" not in answer.lower():
+#             relevant_items = [item for item in inventory_data if item['category'] == 'Electronics' and 'Laptop' in item['name']]
+#             if relevant_items:
+#                 laptop = relevant_items[0]
+#                 answer = f"The price of the laptop we have in stock is ${laptop['price']}. This {laptop['name']} is categorized under {laptop['category']} and we currently have {laptop['quantity']} units available in our inventory."
+#             else:
+#                 answer = "I apologize, but I couldn't find specific information about laptop prices in our current inventory. Please check with our sales department for the most up-to-date pricing and availability of laptops."
+
+#     return answer
+
+import re
+import json
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+import torch
+
+def get_inventory_rag_answer(data, question):
+    try:
+        inventory_data = json.loads(data)['db_data'][0]['text']
+        inventory_data = json.loads(inventory_data)
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return "I'm sorry, but there seems to be an issue with our inventory data. Please try again later."
+
+    model_name = "google/flan-t5-base"
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Prepare a concise version of the inventory data
+    inventory_summary = "\n".join([f"{item['name']}: ${item['price']}, {item['quantity']} in stock, Category: {item['category']}" for item in inventory_data])
+
+    input_text = f"""Task: Answer the following question about our inventory. Use the provided information to give a detailed and accurate response.
+
+Question: {question}
+
+Inventory Information:
+{inventory_summary}
+
+Instructions:
+1. Directly address the question asked.
+2. Provide specific details from the inventory when relevant.
+3. If asked about multiple items or categories, include information on all relevant items.
+4. If the question cannot be answered with the given information, say so politely.
+5. Use complete sentences and proper grammar.
+6. Keep the answer concise but informative.
+"""
+
+    input_ids = tokenizer(input_text, return_tensors="pt", max_length=1024, truncation=True).input_ids
+
+    outputs = model.generate(
+        input_ids,
+        max_length=300,
+        num_return_sequences=1,
+        do_sample=True,
+        top_k=50,
+        top_p=0.95,
+        temperature=0.7,
+        num_beams=4,
+        early_stopping=True
+    )
+
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    # Post-process the answer
+    answer = re.sub(r'\s+', ' ', answer).strip()
+    answer = answer.capitalize()
+    if not answer.endswith(('.', '!', '?')):
+        answer += '.'
+
+    # If the answer doesn't seem to address the question, provide a fallback response
+    question_keywords = set(re.findall(r'\w+', question.lower()))
+    answer_keywords = set(re.findall(r'\w+', answer.lower()))
+    if len(question_keywords.intersection(answer_keywords)) < 2:
+        relevant_items = [item for item in inventory_data if any(keyword in item['name'].lower() for keyword in question_keywords)]
+        if relevant_items:
+            item_info = [f"{item['name']} (${item['price']}, {item['quantity']} in stock)" for item in relevant_items]
+            answer = f"Based on our inventory, here's what I found related to your question: {', '.join(item_info)}. Please let me know if you need more specific information about any of these items."
+        else:
+            answer = "I apologize, but I couldn't find specific information in our inventory to answer your question. Could you please rephrase or provide more details about what you're looking for?"
+
+    return answer
+
+
+def is_relevant_answer(answer, inventory_data):
+    """
+    Check if the generated answer is relevant based on the inventory data.
+    """
+    # Check if the answer contains any inventory item names
+    for item in inventory_data:
+        if item['name'].lower() in answer.lower():
+            return True
+
+    # If not, check similarity scores again for fallback
+    inventory_items = [item['name'].lower() for item in inventory_data]
+    answer_embedding = sentence_transformer_model.encode(answer, convert_to_tensor=True)
+    inventory_embeddings = sentence_transformer_model.encode(inventory_items, convert_to_tensor=True)
+    similarity_scores = util.pytorch_cos_sim(answer_embedding, inventory_embeddings)[0]
+
+    # Consider answer relevant if any item matches above a certain threshold
+    threshold = 0.5  # Adjust as necessary
+    if any(score > threshold for score in similarity_scores):
+        return True
+
+    return False
+
+
+""" """
