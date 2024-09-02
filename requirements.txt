@@ -470,7 +470,6 @@ shellingham==1.5.4
 simple-websocket==1.0.0
 simplejson==3.19.2
 six==1.16.0
-scikit-learn==0.0.post7
 scikit-learn-crfsuite==0.3.6
 scikit-learn-utils==0.0.15
 slack-sdk==3.26.1
