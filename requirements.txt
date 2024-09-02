@@ -425,7 +425,6 @@ pytorch-lightning==2.3.3
 pytorch-metric-learning==2.6.0
 pyttsx3==2.90
 pytz==2024.1
-pywin32==306
 pyxnat==1.6.2
 PyYAML==6.0.1
 pyzmq==26.0.2
