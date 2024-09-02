@@ -377,7 +377,7 @@ PyAudio==0.2.13
 pybboxes==0.1.6
 pycparser==2.21
 pycryptodome==3.20.0
-pydantic==2.8.2
+pydantic==1.10.8
 pydantic_core==2.20.1
 pydeck==0.9.1
 pydot==1.4.2
