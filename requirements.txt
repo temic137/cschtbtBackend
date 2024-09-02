@@ -16,6 +16,7 @@ colorama==0.4.6
     # via click
 flask==3.0.3
     # via -r requirements.in
+gunicorn
 greenlet==3.0.3
     # via sqlalchemy
 idna==3.8
