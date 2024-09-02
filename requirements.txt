@@ -561,7 +561,6 @@ uritemplate==4.1.1
 urllib3==1.26.19
 uvicorn==0.24.0.post1
 validators==0.18.2
-vboxapi==1.0
 virtualenv==20.26.3
 waitress==2.1.2
 wasabi==1.1.2
