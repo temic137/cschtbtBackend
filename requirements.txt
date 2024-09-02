@@ -433,7 +433,6 @@ questionary==1.10.0
 randomname==0.1.5
 rank-bm25==0.2.2
 rapidfuzz==3.9.5
-rasa-sdk==3.6.2
 rdflib==7.0.0
 redis==4.6.0
 regex==2022.10.31
