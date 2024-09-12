@@ -11,13 +11,9 @@ import os
 from functools import wraps
 from transformers import pipeline
 import logging
-import speech_recognition as sr
-import tempfile
-
 
 logging.basicConfig(level=logging.ERROR)
 chatbot_bp = Blueprint('chatbot', __name__)
-recognizer = sr.Recognizer()
 
 def login_required(f):
     @wraps(f)
@@ -66,22 +62,6 @@ def get_chatbots():
     return jsonify(chatbot_list), 200
 
 
-
-
-def transcribe_audio():
-    with sr.Microphone() as source:
-        print("Listening...")
-        audio = recognizer.listen(source)
-        try:
-            text = recognizer.recognize_google(audio)
-            print(f"You said: {text}")
-            return text
-        except sr.UnknownValueError:
-            print("Sorry, I couldn't understand that.")
-            return None
-        except sr.RequestError as e:
-            print(f"Could not request results; {e}")
-            return None
 
 @chatbot_bp.route('/train_chatbot/<chatbot_id>', methods=['POST'])
 @login_required
@@ -156,39 +136,6 @@ def train_chatbot(chatbot_id):
                 current_app.logger.error(f"Error extracting text from URL {website_url}: {str(e)}")
                 return jsonify({"error": f"Error extracting text from URL: {str(e)}"}), 500
         
-
-        # if website_url:
-        #     try:
-        #         extracted_data = extract_text_from_url(website_url)
-                
-        #         # Check if extracted_data is a list and not an error
-        #         if isinstance(extracted_data, list) and extracted_data and extracted_data[0].get('tag') == 'error':
-        #             return jsonify({"error": extracted_data[0]['text']}), 400
-                
-        #         # Create a new merged structure for web_data
-        #         web_data = {
-        #             'pages': []  # A list to store all entries as pages
-        #         }
-                
-        #         # If extracted_data is a list, merge it into the new structure
-        #         if isinstance(extracted_data, list):
-        #             for entry in extracted_data:
-        #                 # Append each entry to the 'pages' list in the merged web_data
-        #                 web_data['pages'].append({
-        #                     'url': entry.get('url', ''),  # Use empty string if 'url' is missing
-        #                     'title': entry.get('title', 'Untitled'),  # Provide a default title if missing
-        #                     'sections': entry.get('sections', [])  # Provide an empty list if 'sections' is missing
-        #                 })
-        #             print(f'"web_data":{web_data}')
-        #         else:
-        #             # If extracted_data is not a list, just store it as it is
-        #             web_data = extracted_data
-                
-        #     except Exception as e:
-        #         current_app.logger.error(f"Error extracting text from URL {website_url}: {str(e)}")
-        #         return jsonify({"error": f"Error extracting text from URL: {str(e)}"}), 500
-
-
         inventory_data = get_formatted_inventory()
         if inventory_data:
             db_data.append({'page': 'inventory', 'text': inventory_data})
@@ -243,7 +190,7 @@ def delete_chatbot(chatbot_id):
     return jsonify({"message": "Chatbot deleted successfully"}), 200
 
 
-# Modify the chatbot_ask function in chatbot.py
+
 @chatbot_bp.route('/chatbot/<chatbot_id>/ask', methods=['POST'])
 @handle_errors
 def chatbot_ask(chatbot_id):
@@ -251,54 +198,36 @@ def chatbot_ask(chatbot_id):
     if not chatbot:
         return jsonify({"error": "Chatbot not found"}), 404
 
-    if request.content_type.startswith('multipart/form-data'):
-        # Handle file upload (audio input)
-        input_type = request.form.get('input_type', 'text')
-        if input_type == 'audio':
-            if 'audio' not in request.files:
-                return jsonify({"error": "No audio file provided"}), 400
-            file = request.files['audio']
-            if file.filename == '':
-                return jsonify({"error": "No selected file"}), 400
-            if file:
-                filename = secure_filename(file.filename)
-                file_path = os.path.join(tempfile.gettempdir(), filename)
-                file.save(file_path)
-                try:
-                    question = transcribe_audio_file(file_path)
-                finally:
-                    os.remove(file_path)  # Clean up the temporary file
-                if not question:
-                    return jsonify({"error": "Failed to transcribe audio"}), 400
-        else:
-            question = request.form.get('question')
-    elif request.content_type == 'application/json':
-        # Handle JSON input
-        data = request.json
-        input_type = data.get('input_type', 'text')
-        if input_type == 'audio':
-            return jsonify({"error": "Audio input not supported with JSON content-type"}), 400
-        question = data.get('question')
-    else:
-        return jsonify({"error": "Unsupported content type"}), 415
-
+    question = request.json.get('question')
     if not question:
         return jsonify({"error": "No question provided"}), 400
 
     try:
+        # Ensure chatbot.data is a string
         chatbot_data_str = chatbot.data if isinstance(chatbot.data, str) else json.dumps(chatbot.data)
+
+        # Parse the JSON string
         chatbot_data = json.loads(chatbot_data_str)
+        logging.info(f"Parsed chatbot data: {chatbot_data}")
+        logging.info(f"Final chatbot data structure: {type(chatbot_data)}")
+
+        # Handle both list and dictionary cases
         if isinstance(chatbot_data, list):
+            # If it's a list, use the last item (most recent data)
             chatbot_data = chatbot_data[-1]
         elif not isinstance(chatbot_data, dict):
             raise ValueError("Invalid chatbot data format")
 
+        logging.info(f"Raw chatbot data: {chatbot.data}")
+        # Now chatbot_data should be a dictionary
         if any(keyword in question.lower() for keyword in ["proce", "inventory", "stock", "available", "category", "type"]):
             answer = get_inventory_rag_answer(json.dumps(chatbot_data), question)
         else:
             answer = get_general_answer(json.dumps(chatbot_data), question)
 
-        return jsonify({"question": question, "answer": answer})
+        return jsonify({"answer": answer})
+
+    
     except json.JSONDecodeError as e:
         current_app.logger.error(f"JSON decode error: {str(e)}")
         return jsonify({"error": "Invalid chatbot data format"}), 500
@@ -306,17 +235,6 @@ def chatbot_ask(chatbot_id):
         current_app.logger.error(f"Error in chatbot_ask: {str(e)}")
         return jsonify({"error": "An unexpected error occurred"}), 500
 
-def transcribe_audio_file(file_path):
-    r = sr.Recognizer()
-    with sr.AudioFile(file_path) as source:
-        audio = r.record(source)
-    try:
-        return r.recognize_google(audio)
-    except sr.UnknownValueError:
-        print("Google Speech Recognition could not understand audio")
-    except sr.RequestError as e:
-        print(f"Could not request results from Google Speech Recognition service; {e}")
-    return None
 
 @chatbot_bp.route('/get_chatbot_script/<chatbot_id>')
 @handle_errors

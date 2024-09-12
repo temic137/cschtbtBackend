@@ -3,7 +3,6 @@ import re
 from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer,util
 from transformers import pipeline, BartForConditionalGeneration, BartTokenizer,DistilBertTokenizer, BertForQuestionAnswering, BertTokenizer
-
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 import torch
 import nltk
@@ -67,41 +66,241 @@ def get_formatted_inventory():
 
 
 
+# Load the sentence transformer model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Load the question-answering pipeline
+qa_pipeline = pipeline("question-answering", model="distilbert-base-cased-distilled-squad", tokenizer="distilbert-base-cased")
+
+import json
+import nltk
+from sentence_transformers import SentenceTransformer, util
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
+# Load models (do this once at the start of your application)
+sentence_transformer = SentenceTransformer('all-MiniLM-L6-v2')
+flan_t5_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+flan_t5_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+
+def preprocess_text(text):
+    # Implement more robust text preprocessing
+    text = text.lower()
+    text = ' '.join(nltk.word_tokenize(text))
+    return text
+
 def get_general_answer(data, question):
     try:
-        chatbot_data = json.loads(data)
+        chatbot_data = json.loads(data) if isinstance(data, str) else data
         pdf_data = chatbot_data.get('pdf_data', [])
+        folder_data = chatbot_data.get('folder_data', [])
+        web_data = chatbot_data.get('web_data', {})
     except json.JSONDecodeError:
-        logging.error("Failed to decode chatbot data")
         return "I'm sorry, but there seems to be an issue with our data. Please try again later."
 
-    chunks = []
-    for item in pdf_data:
-        if 'text' in item:
-            text_chunks = nltk.sent_tokenize(item['text'])
-            chunks.extend(text_chunks)
+    # Preprocess and structure the data
+    structured_data = preprocess_data(pdf_data, folder_data, web_data)
 
-    if not chunks:
-        return "I'm sorry, but I don't have enough information to answer your question."
+    # Find the most relevant information using a hybrid approach
+    relevant_info = find_relevant_info_hybrid(question, structured_data)
 
-    preprocessed_chunks = [preprocess_text(chunk) for chunk in chunks]
-    question_embedding = sentence_transformer_model.encode(preprocess_text(question), convert_to_tensor=True)
-    chunk_embeddings = sentence_transformer_model.encode(preprocessed_chunks, convert_to_tensor=True)
+    # Generate the answer
+    answer = generate_answer(question, relevant_info)
 
-    similarity_scores = util.pytorch_cos_sim(question_embedding, chunk_embeddings)[0]
-    top_k = min(TOP_K, len(similarity_scores))
-    best_match_indices = similarity_scores.topk(top_k).indices.tolist()
-    context = " ".join([chunks[i] for i in best_match_indices])
+    # Post-process the answer
+    answer = post_process_answer(answer, question)
 
-    qa_input = {'question': question, 'context': context}
-    result = qa_model(qa_input)
+    return answer
 
-    input_text = f"question: {question} context: {context}"
-    input_ids = bart_tokenizer.encode(input_text, return_tensors='pt')
-    summary_ids = bart_model.generate(input_ids, max_length=150, num_beams=4, length_penalty=2.0, early_stopping=True)
-    complete_answer = bart_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
 
-    return complete_answer
+
+
+
+# def get_relevant_items(question, inventory_data, top_k=5):
+#     inventory_texts = [
+#         f"{item['name']} {item['category']} ${item['price']} {item['quantity']} in stock"
+#         for item in inventory_data
+#     ]
+#     preprocessed_inventory = [preprocess_text(text) for text in inventory_texts]
+
+#     question_embedding = sentence_transformer.encode(preprocess_text(question), convert_to_tensor=True)
+#     inventory_embeddings = sentence_transformer.encode(preprocessed_inventory, convert_to_tensor=True)
+
+#     similarities = util.pytorch_cos_sim(question_embedding, inventory_embeddings)[0]
+#     top_k_indices = similarities.argsort(descending=True)[:top_k]
+
+#     return [inventory_data[i] for i in top_k_indices]
+
+
+def get_relevant_items(question, inventory_data, top_k=5):
+    try:
+        inventory_texts = [
+            f"{item['name']} {item['category']} ${item['price']} {item['quantity']} in stock"
+            for item in inventory_data
+        ]
+        preprocessed_inventory = [preprocess_text(text) for text in inventory_texts]
+
+        question_embedding = sentence_transformer.encode(preprocess_text(question), convert_to_tensor=True)
+        inventory_embeddings = sentence_transformer.encode(preprocessed_inventory, convert_to_tensor=True)
+
+        logging.debug(f"Question embedding shape: {question_embedding.shape}")
+        logging.debug(f"Inventory embeddings shape: {inventory_embeddings.shape}")
+
+        if question_embedding.shape[0] == 0 or inventory_embeddings.shape[0] == 0:
+            raise ValueError("Empty embedding detected")
+
+        similarities = util.pytorch_cos_sim(question_embedding, inventory_embeddings)[0]
+        top_k_indices = similarities.argsort(descending=True)[:top_k]
+
+        return [inventory_data[i] for i in top_k_indices]
+    except Exception as e:
+        logging.error(f"Error in get_relevant_items: {str(e)}")
+        return []
+
+
+def preprocess_data(pdf_data, folder_data, web_data):
+    structured_data = []
+
+    logging.debug(f"Preprocessing PDF data: {len(pdf_data)} items")
+    logging.debug(f"Preprocessing folder data: {len(folder_data)} items")
+    logging.debug(f"Preprocessing web data: {bool(web_data)}")
+
+    # Process PDF and folder data
+    for item in pdf_data + folder_data:
+        if isinstance(item, dict) and 'text' in item:
+            sentences = nltk.sent_tokenize(item['text'])
+            structured_data.extend([{'type': 'text', 'content': sent, 'source': 'pdf/folder'} for sent in sentences])
+
+    # Process web data
+    if web_data:
+        logging.debug(f"Web data keys: {web_data.keys()}")
+        if isinstance(web_data, list) and len(web_data) > 0:
+            web_data = web_data[0]  # Take the first item if it's a list
+        
+        if isinstance(web_data, dict):
+            if 'title' in web_data:
+                structured_data.append({'type': 'title', 'content': web_data['title'], 'source': 'web'})
+            
+            if 'sections' in web_data:
+                for section in web_data['sections']:
+                    if isinstance(section, dict):
+                        if 'heading' in section:
+                            structured_data.append({'type': 'heading', 'content': section['heading'], 'source': 'web'})
+                        if 'content' in section:
+                            structured_data.extend([{'type': 'web_content', 'content': item, 'source': 'web'} for item in section['content']])
+            
+            if 'sub_pages' in web_data:
+                for sub_page in web_data['sub_pages']:
+                    structured_data.extend(preprocess_data([], [], [sub_page]))  # Recursive call for sub-pages
+
+    logging.info(f"Preprocessed data: {len(structured_data)} items")
+    logging.debug(f"First few preprocessed items: {structured_data[:5]}")
+    return structured_data
+
+def find_relevant_info_hybrid(question, structured_data):
+    # Semantic search using sentence transformers
+    question_embedding = sentence_transformer.encode(question, convert_to_tensor=True)
+    content_list = [item['content'] for item in structured_data]
+    content_embeddings = sentence_transformer.encode(content_list, convert_to_tensor=True)
+    semantic_scores = util.pytorch_cos_sim(question_embedding, content_embeddings)[0]
+
+    # Keyword-based search using TF-IDF
+    vectorizer = TfidfVectorizer()
+    tfidf_matrix = vectorizer.fit_transform([question] + content_list)
+    keyword_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:])[0]
+
+    # Combine scores (you can adjust the weights)
+    combined_scores = 0.7 * semantic_scores.numpy() + 0.3 * keyword_scores
+
+    # Get top results
+    top_k = min(7, len(combined_scores))
+    best_match_indices = combined_scores.argsort()[-top_k:][::-1]
+
+    return [structured_data[i] for i in best_match_indices]
+
+# def find_relevant_info_hybrid(question, structured_data):
+#     try:
+#         content_list = [item['content'] for item in structured_data]
+#         if not content_list:
+#             logging.warning("No content to process in structured_data")
+#             return []
+
+#         # Semantic search using sentence transformers
+#         question_embedding = sentence_transformer.encode(question, convert_to_tensor=True)
+#         content_embeddings = sentence_transformer.encode(content_list, convert_to_tensor=True)
+
+#         logging.debug(f"Question embedding shape: {question_embedding.shape}")
+#         logging.debug(f"Content embeddings shape: {content_embeddings.shape}")
+
+#         semantic_scores = util.pytorch_cos_sim(question_embedding, content_embeddings)[0]
+
+#         # Keyword-based search using TF-IDF
+#         vectorizer = TfidfVectorizer()
+#         tfidf_matrix = vectorizer.fit_transform([question] + content_list)
+#         keyword_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:])[0]
+
+#         logging.debug(f"Semantic scores shape: {semantic_scores.shape}")
+#         logging.debug(f"Keyword scores shape: {keyword_scores.shape}")
+
+#         if semantic_scores.shape != keyword_scores.shape:
+#             raise ValueError(f"Shape mismatch: semantic_scores {semantic_scores.shape}, keyword_scores {keyword_scores.shape}")
+
+#         # Combine scores (you can adjust the weights)
+#         combined_scores = 0.7 * semantic_scores.numpy() + 0.3 * keyword_scores
+
+#         # Get top results
+#         top_k = min(7, len(combined_scores))
+#         best_match_indices = combined_scores.argsort()[-top_k:][::-1]
+
+#         return [structured_data[i] for i in best_match_indices]
+#     except Exception as e:
+#         logging.error(f"Error in find_relevant_info_hybrid: {str(e)}")
+#         return []
+
+def generate_answer(question, relevant_info):
+    context = "\n".join([f"{item['type']} ({item['source']}): {item['content']}" for item in relevant_info])
+    
+    input_text = f"""
+    Question: {question}
+    
+    Context:
+    {context}
+    
+    Task: Answer the question based on the given context. If the information is not available or if you're not sure, say so. Provide a detailed and accurate response.
+    """
+
+    input_ids = flan_t5_tokenizer(input_text, return_tensors="pt", max_length=512, truncation=True).input_ids
+    
+    with torch.no_grad():
+        outputs = flan_t5_model.generate(
+            input_ids,
+            max_length=200,
+            num_return_sequences=1,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95,
+            temperature=0.7,
+            num_beams=4,
+            early_stopping=True
+        )
+
+    answer = flan_t5_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return answer
+
+def post_process_answer(answer, question):
+    # Ensure the answer directly addresses the question
+    if not any(keyword in answer.lower() for keyword in question.lower().split()):
+        answer = f"To answer your question about {question.lower()}: {answer}"
+
+    # Add confidence statement if the answer seems uncertain
+    uncertainty_keywords = ['might', 'maybe', 'possibly', 'not sure', 'could be']
+    if any(keyword in answer.lower() for keyword in uncertainty_keywords):
+        answer += " Please note that this answer is based on the available information and may not be completely certain."
+
+    return answer
 
 # need to improve on this part(high priority)
 def split_complex_query(query):
@@ -117,71 +316,18 @@ def split_complex_query(query):
     return questions
 
 
-def get_relevant_items(question, inventory_data, top_k=5):
-    inventory_texts = [
-        f"{item['name']} {item['category']} ${item['price']} {item['quantity']} in stock"
-        for item in inventory_data
-    ]
-    preprocessed_inventory = [preprocess_text(text) for text in inventory_texts]
 
-    question_embedding = sentence_transformer.encode(preprocess_text(question), convert_to_tensor=True)
-    inventory_embeddings = sentence_transformer.encode(preprocessed_inventory, convert_to_tensor=True)
 
-    similarities = util.pytorch_cos_sim(question_embedding, inventory_embeddings)[0]
-    top_k_indices = similarities.argsort(descending=True)[:top_k]
-
-    return [inventory_data[i] for i in top_k_indices]
-
-def generate_answer(question, context):
-    input_text = f"""Task: Answer the following question about our inventory. Use the provided information to give a detailed and accurate response.
-
-    Question: {question}
-
-    Relevant Inventory Information:
-    {context}
-
-    Instructions:
-    1. Directly address the question asked.
-    2. Provide specific details from the inventory when relevant.
-    3. If asked about multiple items or categories, include information on all relevant items.
-    4. If the question cannot be answered with the given information, say so politely.
-    5. Use complete sentences and proper grammar.
-    6. Keep the answer concise but informative.
-    """
-
-    input_ids = flan_t5_tokenizer(input_text, return_tensors="pt", max_length=1024, truncation=True).input_ids
-    
-    with torch.no_grad():
-        outputs = flan_t5_model.generate(
-            input_ids,
-            max_length=300,
-            num_return_sequences=1,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            temperature=0.7,
-            num_beams=4,
-            early_stopping=True
-        )
-
-    answer = flan_t5_tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return answer
-
-def post_process_answer(answer):
-    answer = re.sub(r'\s+', ' ', answer).strip()
-    answer = answer[0].upper() + answer[1:]  # Capitalize first letter
-    if not answer.endswith(('.', '!', '?')):
-        answer += '.'
-    return answer
 
 def get_inventory_rag_answer(data, query):
     try:
-        inventory_data = json.loads(data)['db_data'][0]['text']
-        inventory_data = json.loads(inventory_data)
-    except (json.JSONDecodeError, KeyError, IndexError):
+        chatbot_data = json.loads(data) if isinstance(data, str) else data
+        inventory_data = chatbot_data['db_data'][0]['text']
+        inventory_data = json.loads(inventory_data) if isinstance(inventory_data, str) else inventory_data
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+        logging.error(f"Error parsing inventory data: {e}")
         return "I apologize, but there seems to be an issue with our inventory data. Please try again later."
 
-    # Split the complex query into individual questions
     questions = split_complex_query(query)
     
     final_answer = ""
@@ -189,7 +335,7 @@ def get_inventory_rag_answer(data, query):
         relevant_items = get_relevant_items(question, inventory_data)
         
         inventory_summary = "\n".join([
-            f"{item['name']}: ${item['price']}, {item['quantity']} in stock, Category: {item['category']}"
+            f"{item['name']}: ${item['price']:.2f}, {item['quantity']} in stock, Category: {item['category']}"
             for item in relevant_items
         ])
 
@@ -200,5 +346,42 @@ def get_inventory_rag_answer(data, query):
     return final_answer.strip()
 
 
+# def get_inventory_rag_answer(data, query):
+#     try:
+#         chatbot_data = json.loads(data) if isinstance(data, str) else data
+#         inventory_data = chatbot_data['db_data'][0]['text']
+#         inventory_data = json.loads(inventory_data) if isinstance(inventory_data, str) else inventory_data
 
+#         if not inventory_data:
+#             raise ValueError("Empty inventory data")
 
+#         logging.debug(f"Inventory data size: {len(inventory_data)}")
+#         logging.debug(f"Query: {query}")
+
+#         questions = split_complex_query(query)
+        
+#         final_answer = ""
+#         for question in questions:
+#             relevant_items = get_relevant_items(question, inventory_data)
+            
+#             if not relevant_items:
+#                 final_answer += "I couldn't find any relevant inventory items for this question. "
+#                 continue
+
+#             inventory_summary = "\n".join([
+#                 f"{item['name']}: ${item['price']:.2f}, {item['quantity']} in stock, Category: {item['category']}"
+#                 for item in relevant_items
+#             ])
+
+#             answer = generate_answer(question, inventory_summary)
+#             answer = post_process_answer(answer)
+#             final_answer += answer + " "
+
+#         return final_answer.strip() if final_answer else "I'm sorry, but I couldn't generate a relevant answer based on the available inventory data."
+
+#     except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+#         logging.error(f"Error parsing inventory data: {e}")
+#         return "I apologize, but there seems to be an issue with our inventory data. Please try again later."
+#     except Exception as e:
+#         logging.error(f"Unexpected error in get_inventory_rag_answer: {str(e)}")
+#         return "I encountered an unexpected error while processing your question. Please try again later."
